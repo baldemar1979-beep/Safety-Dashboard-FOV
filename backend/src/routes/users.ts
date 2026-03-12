@@ -86,7 +86,7 @@ router.delete('/:id', authenticateToken, requireAdmin, (req: AuthRequest, res: R
 // Get list of unique driver names from events (for admin to assign to users)
 router.get('/drivers/list', authenticateToken, requireAdmin, (_req: AuthRequest, res: Response) => {
   const drivers = db.prepare('SELECT DISTINCT driver FROM fov_events WHERE driver IS NOT NULL ORDER BY driver').all();
-  res.json(drivers.map((d: { driver: string }) => d.driver));
+  res.json((drivers as { driver: string }[]).map((d) => d.driver));
 });
 
 export default router;

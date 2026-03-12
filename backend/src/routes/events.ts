@@ -1,6 +1,7 @@
 import { Router, Response } from 'express';
 import multer from 'multer';
-import XLSX from 'xlsx';
+import ExcelJS from 'exceljs';
+import { Readable } from 'stream';
 import db from '../database';
 import { authenticateToken, requireAdmin, AuthRequest } from '../middleware/auth';
 
@@ -33,21 +34,76 @@ function getWeekNumber(date: Date): { week: number; year: number } {
   return { week, year: d.getUTCFullYear() };
 }
 
+/** Convert an ExcelJS cell value to a plain string/number/null */
+function cellValue(val: ExcelJS.CellValue): string | number | null {
+  if (val === null || val === undefined) return null;
+  if (val instanceof Date) return val.toISOString();
+  if (typeof val === 'object' && 'result' in val) {
+    // Formula cell — use the cached result
+    return cellValue((val as ExcelJS.CellFormulaValue).result as ExcelJS.CellValue);
+  }
+  if (typeof val === 'object' && 'richText' in val) {
+    // Rich text cell
+    return (val as ExcelJS.CellRichTextValue).richText.map((r) => r.text).join('');
+  }
+  if (typeof val === 'number' || typeof val === 'string' || typeof val === 'boolean') {
+    return String(val);
+  }
+  return String(val);
+}
+
 // Upload Excel file (admin only)
-router.post('/upload', authenticateToken, requireAdmin, upload.single('file'), (req: AuthRequest, res: Response) => {
+router.post('/upload', authenticateToken, requireAdmin, upload.single('file'), async (req: AuthRequest, res: Response) => {
   if (!req.file) {
     res.status(400).json({ error: 'No file uploaded' });
     return;
   }
 
   try {
-    const workbook = XLSX.read(req.file.buffer, { type: 'buffer', cellDates: true });
-    const sheetName = workbook.SheetNames[0];
-    const sheet = workbook.Sheets[sheetName];
-    const rows = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet, { defval: null });
+    const workbook = new ExcelJS.Workbook();
+
+    // Read from buffer via a Readable stream
+    const bufferStream = Readable.from(req.file.buffer);
+    const isCSV = req.file.originalname.toLowerCase().endsWith('.csv') ||
+                  req.file.mimetype === 'text/csv';
+
+    if (isCSV) {
+      await workbook.csv.read(bufferStream);
+    } else {
+      await workbook.xlsx.read(bufferStream);
+    }
+
+    const worksheet = workbook.worksheets[0];
+    if (!worksheet) {
+      res.status(400).json({ error: 'No worksheet found in the uploaded file' });
+      return;
+    }
+
+    // Read header row
+    const headerRow = worksheet.getRow(1);
+    const headers: string[] = [];
+    headerRow.eachCell({ includeEmpty: false }, (cell) => {
+      headers.push(String(cellValue(cell.value) ?? '').trim());
+    });
+
+    if (headers.length === 0) {
+      res.status(400).json({ error: 'No data found in the uploaded file' });
+      return;
+    }
+
+    // Parse data rows into plain objects
+    const rows: Record<string, string | number | null>[] = [];
+    worksheet.eachRow({ includeEmpty: false }, (row, rowNumber) => {
+      if (rowNumber === 1) return; // skip header
+      const obj: Record<string, string | number | null> = {};
+      headers.forEach((header, idx) => {
+        obj[header] = cellValue(row.getCell(idx + 1).value);
+      });
+      rows.push(obj);
+    });
 
     if (rows.length === 0) {
-      res.status(400).json({ error: 'No data found in the uploaded file' });
+      res.status(400).json({ error: 'No data rows found in the uploaded file' });
       return;
     }
 
@@ -57,9 +113,9 @@ router.post('/upload', authenticateToken, requireAdmin, upload.single('file'), (
     let yearNum = getWeekNumber(now).year;
 
     for (const row of rows) {
-      const dt = row['detection_time'] as string | null;
+      const dt = row['detection_time'];
       if (dt) {
-        const parsed = new Date(dt);
+        const parsed = new Date(String(dt));
         if (!isNaN(parsed.getTime())) {
           const wk = getWeekNumber(parsed);
           weekNum = wk.week;
@@ -77,7 +133,7 @@ router.post('/upload', authenticateToken, requireAdmin, upload.single('file'), (
 
     const uploadId = uploadResult.lastInsertRowid;
 
-    // Insert events
+    // Insert events in a single transaction
     const insertEvent = db.prepare(`
       INSERT INTO fov_events (
         event_id, vehicle_id, vehicle, driver, detection_time, utc_offset,
@@ -92,13 +148,13 @@ router.post('/upload', authenticateToken, requireAdmin, upload.single('file'), (
       )
     `);
 
-    const insertMany = db.transaction((events: Record<string, unknown>[]) => {
+    const insertMany = db.transaction((events: Record<string, string | number | null>[]) => {
       for (const row of events) {
         const detectionTime = row['detection_time'];
         let rowWeek = weekNum;
         let rowYear = yearNum;
         if (detectionTime) {
-          const parsed = new Date(detectionTime as string);
+          const parsed = new Date(String(detectionTime));
           if (!isNaN(parsed.getTime())) {
             const wk = getWeekNumber(parsed);
             rowWeek = wk.week;
@@ -248,7 +304,7 @@ router.get('/:id', authenticateToken, (req: AuthRequest, res: Response) => {
 });
 
 // Export events to Excel
-router.get('/export/excel', authenticateToken, (req: AuthRequest, res: Response) => {
+router.get('/export/excel', authenticateToken, async (req: AuthRequest, res: Response) => {
   const { driver, event_type, week, year } = req.query as Record<string, string>;
 
   const conditions: string[] = [];
@@ -285,17 +341,35 @@ router.get('/export/excel', authenticateToken, (req: AuthRequest, res: Response)
     classification, fleet, timezone, account, service_provider, shift, crew,
     guardian_unit, software_version, tags
     FROM fov_events ${where} ORDER BY detection_time DESC
-  `).all(...params);
+  `).all(...params) as Record<string, unknown>[];
 
-  const wb = XLSX.utils.book_new();
-  const ws = XLSX.utils.json_to_sheet(events);
-  XLSX.utils.book_append_sheet(wb, ws, 'FOV Events');
+  const workbook = new ExcelJS.Workbook();
+  const worksheet = workbook.addWorksheet('FOV Events');
 
-  const buffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+  if (events.length > 0) {
+    // Add header row from the first event's keys
+    worksheet.columns = Object.keys(events[0]).map((key) => ({
+      header: key,
+      key,
+      width: Math.max(key.length + 2, 14),
+    }));
+    // Add data rows
+    worksheet.addRows(events);
+    // Style the header
+    worksheet.getRow(1).font = { bold: true };
+    worksheet.getRow(1).fill = {
+      type: 'pattern',
+      pattern: 'solid',
+      fgColor: { argb: 'FF1D4ED8' },
+    };
+    worksheet.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
+  }
 
   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-  res.setHeader('Content-Disposition', `attachment; filename="fov-events-export.xlsx"`);
-  res.send(buffer);
+  res.setHeader('Content-Disposition', 'attachment; filename="fov-events-export.xlsx"');
+
+  await workbook.xlsx.write(res);
+  res.end();
 });
 
 // Get upload history (admin only)
